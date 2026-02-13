@@ -1,14 +1,18 @@
 """Dataloader for HuBERT masked pre-training.
 
 Reads a pre-built index (from prepare_pretraining_index.py) that maps
-(tar_number, key) -> {start_sec, end_sec, labels}.  Streams audio from
-HuggingFace tars via WebDataset, extracts the specific chunk for each
+(tar_number, key) -> {start_sec, end_sec, labels, language}.  Streams audio
+from HuggingFace tars via WebDataset, extracts the specific chunk for each
 matching file, and returns (waveform, labels) pairs.
+
+When the index contains a "language" field, entries are grouped by language
+and streamed via wds.RandomMix for proportional interleaving.
 """
 
 import os
 import pickle
 import re
+from collections import defaultdict
 
 import numpy as np
 import torch
@@ -20,14 +24,26 @@ def _build_tar_urls(tar_numbers, hf_token):
     """Build pipe:curl URLs for a specific set of tar numbers."""
     token = f"Authorization:Bearer {hf_token}"
     urls = []
-    for tn in tar_numbers:
+    for tn in sorted(tar_numbers):
+        tn_str = str(tn).zfill(6)
         folder = "audio" if int(tn) <= 5000 else "audio2"
         raw = (
             f"https://huggingface.co/datasets/MLCommons/"
-            f"unsupervised_peoples_speech/resolve/main/{folder}/{tn}.tar?download=True"
+            f"unsupervised_peoples_speech/resolve/main/{folder}/{tn_str}.tar?download=True"
         )
         urls.append(f"pipe:curl -s -L {raw} -H {token}")
     return urls
+
+
+def _build_lookup(entries):
+    """Build (tar_number, key) -> list[entry] lookup from index entries."""
+    lookup = {}
+    for entry in entries:
+        k = (entry["tar_number"], entry["key"])
+        if k not in lookup:
+            lookup[k] = []
+        lookup[k].append(entry)
+    return lookup
 
 
 def _decode_pretraining(sample, lookup, target_sr=16000):
@@ -41,26 +57,26 @@ def _decode_pretraining(sample, lookup, target_sr=16000):
     m = re.search(r"/(\d+)\.tar", url)
     if m is None:
         return []
-    tar_number = m.group(1)
+    tar_number = m.group(1).zfill(6)
 
-    entries = lookup.get((tar_number, key))
+    entries = lookup.get((tar_number, os.path.basename(key)))
     if entries is None:
         return []
 
     results = []
     try:
         decoder = AudioDecoder(source=mp3_bytes, sample_rate=target_sr, num_channels=1)
-        
+
         for entry in entries:
             waveform = decoder.get_samples_played_in_range(
                 entry["start_sec"], entry["end_sec"]
             ).data.squeeze(0)
-            
+
             results.append({
                 "waveform": waveform.numpy(),
                 "labels": entry["labels"],
             })
-            
+
     except Exception:
         return []
 
@@ -97,8 +113,22 @@ def collate_pretraining(batch):
     }
 
 
+# Helper to flatten list of lists
+def _flatten_list(stream):
+    for sample in stream:
+        if isinstance(sample, list):
+            for x in sample:
+                yield x
+        else:
+            yield sample
+
+
 def build_pretraining_dataset(index_path, hf_token=None, target_sr=16000):
     """Build a WebDataset that yields {waveform, labels} from a pretraining index.
+
+    If the index entries contain a "language" field, creates one WebDataset per
+    language and combines them with wds.RandomMix for proportional interleaving.
+    Otherwise falls back to a single dataset over all tars.
 
     Args:
         index_path: Path to the pickle index produced by prepare_pretraining_index.py.
@@ -113,33 +143,66 @@ def build_pretraining_dataset(index_path, hf_token=None, target_sr=16000):
     with open(index_path, "rb") as f:
         index_entries = pickle.load(f)
 
-    # Build lookup: (tar_number, key) -> list of entries
-    lookup = {}
-    tar_numbers = set()
-    for entry in index_entries:
-        k = (entry["tar_number"], entry["key"])
-        if k not in lookup:
-            lookup[k] = []
-        lookup[k].append(entry)
-        tar_numbers.add(entry["tar_number"])
+    # Check if entries have language info
+    has_language = any("language" in e for e in index_entries)
 
+    if has_language:
+        return _build_multilang_dataset(index_entries, hf_token, target_sr)
+    else:
+        return _build_single_dataset(index_entries, hf_token, target_sr)
+
+
+def _build_single_dataset(index_entries, hf_token, target_sr):
+    """Build a single WebDataset over all entries (legacy path)."""
+    lookup = _build_lookup(index_entries)
+    tar_numbers = {e["tar_number"] for e in index_entries}
     urls = _build_tar_urls(tar_numbers, hf_token)
-
-    # Helper to flatten list of lists
-    def flatten_list(stream):
-        for sample in stream:
-            if isinstance(sample, list):
-                for x in sample:
-                    yield x
-            else:
-                yield sample
 
     dataset = (
         wds.WebDataset(urls, shardshuffle=True, handler=wds.handlers.ignore_and_continue)
         .to_tuple("mp3", "__key__", "__url__", handler=wds.handlers.ignore_and_continue)
         .map(lambda s: _decode_pretraining(s, lookup, target_sr))
-        .compose(flatten_list)
-        .shuffle(1000)  # Shuffle buffer for better mixing of chunks
+        .compose(_flatten_list)
+        .shuffle(1000)
     )
 
     return dataset
+
+
+def _build_multilang_dataset(index_entries, hf_token, target_sr):
+    """Build per-language WebDatasets combined with RandomMix."""
+    # Group entries by language
+    entries_by_lang = defaultdict(list)
+    for entry in index_entries:
+        lang = entry.get("language", "unknown")
+        entries_by_lang[lang].append(entry)
+
+    print(f"Building multilang dataset with {len(entries_by_lang)} languages:")
+    for lang in sorted(entries_by_lang):
+        print(f"  {lang}: {len(entries_by_lang[lang])} entries")
+
+    datasets = []
+    weights = []
+
+    for lang, entries in sorted(entries_by_lang.items()):
+        lookup = _build_lookup(entries)
+        tar_numbers = {e["tar_number"] for e in entries}
+        urls = _build_tar_urls(tar_numbers, hf_token)
+
+        ds = (
+            wds.WebDataset(urls, shardshuffle=False, handler=wds.handlers.ignore_and_continue)
+            .to_tuple("mp3", "__key__", "__url__", handler=wds.handlers.ignore_and_continue)
+            .map(lambda s, lk=lookup: _decode_pretraining(s, lk, target_sr))
+            .compose(_flatten_list)
+        )
+        datasets.append(ds)
+        weights.append(len(entries))
+
+    # Normalize weights to probabilities
+    total = sum(weights)
+    probs = [w / total for w in weights]
+
+    # Interleave proportionally across languages
+    # shuffle(5000): larger buffer compensates for tar-sequential locality
+    dataset = wds.RandomMix(datasets, probs=probs)
+    return dataset.shuffle(5000)
