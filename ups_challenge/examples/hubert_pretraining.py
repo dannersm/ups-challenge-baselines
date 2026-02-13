@@ -213,6 +213,7 @@ def train_hubert(
     hf_token=None,
     max_steps=None,
     output_dir="./checkpoints",
+    cache_dir=None,
     grad_accum_steps=4,
     warmup_steps=1500,
     max_grad_norm=1.0,
@@ -248,7 +249,8 @@ def train_hubert(
 
     # Data
     print(f"Loading pretraining index: {index_path}")
-    dataset = build_pretraining_dataset(index_path=index_path, hf_token=hf_token)
+    dataset = build_pretraining_dataset(index_path=index_path, hf_token=hf_token,
+                                            cache_dir=cache_dir)
     data_loader = torch.utils.data.DataLoader(
         dataset,
         batch_size=batch_size,
@@ -359,9 +361,11 @@ if __name__ == "__main__":
     parser.add_argument("--learning_rate", type=float, default=5e-5)
     parser.add_argument("--max_steps", type=int, default=None)
     parser.add_argument("--grad_accum_steps", type=int, default=4)
-    parser.add_argument("--warmup_steps", type=int, default=1500)
+    parser.add_argument("--warmup_steps", type=int, default=500)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument("--hf_token", type=str, default=None)
+    parser.add_argument("--cache_dir", type=str, default="./data/tar_cache",
+                        help="Directory to cache downloaded tars (reused across runs)")
     parser.add_argument("--output_dir", type=str, default="./checkpoints")
     args = parser.parse_args()
 
@@ -380,6 +384,7 @@ if __name__ == "__main__":
         hf_token=hf_token,
         max_steps=args.max_steps,
         output_dir=args.output_dir,
+        cache_dir=args.cache_dir,
         grad_accum_steps=args.grad_accum_steps,
         warmup_steps=args.warmup_steps,
         max_grad_norm=args.max_grad_norm,

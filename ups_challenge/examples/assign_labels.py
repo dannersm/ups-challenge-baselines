@@ -56,15 +56,25 @@ def extract_mfcc(waveform, sample_rate=16000, n_mfcc=13, hop_length=320):
 # URL builder
 # ---------------------------------------------------------------------------
 
-def _build_tar_url(tar_number: str, hf_token: str) -> str:
-    token = f"Authorization:Bearer {hf_token}"
+def _download_tar(tar_number: str, hf_token: str, cache_dir: str) -> str:
+    """Download a tar to cache_dir if not already cached, return local path."""
     tn_str = str(tar_number).zfill(6)
+    dest = os.path.join(cache_dir, f"{tn_str}.tar")
+    if os.path.exists(dest):
+        return dest
     folder = "audio" if int(tar_number) <= 5000 else "audio2"
-    raw = (
+    url = (
         f"https://huggingface.co/datasets/MLCommons/"
         f"unsupervised_peoples_speech/resolve/main/{folder}/{tn_str}.tar?download=True"
     )
-    return f"pipe:curl -s -L {raw} -H {token}"
+    temp = dest + f".tmp{os.getpid()}"
+    import subprocess
+    subprocess.run(
+        ["curl", "-s", "-L", "-o", temp, "-H", f"Authorization:Bearer {hf_token}", url],
+        check=True,
+    )
+    os.rename(temp, dest)
+    return dest
 
 
 # ---------------------------------------------------------------------------
@@ -80,7 +90,7 @@ def main():
     parser.add_argument("--n_clusters", type=int, default=100)
     parser.add_argument("--output_dir", type=str, default="./data")
     parser.add_argument("--hf_token", type=str, default=None)
-    parser.add_argument("--cache_dir", type=str, default=None,
+    parser.add_argument("--cache_dir", type=str, default="./data/tar_cache",
                         help="Directory to cache downloaded tars (reused on subsequent runs)")
     parser.add_argument("--kmeans_sample_frames", type=int, default=500_000,
                         help="Max MFCC frames subsampled for k-means fitting")
@@ -127,8 +137,7 @@ def main():
         chunks_in_tar = sum(1 for e in index_entries if e["tar_number"] == tar_number)
         t0 = time.time()
         first_chunk_logged = False
-        url = _build_tar_url(tar_number, hf_token)
-        pbar.write(f"\n[{tar_idx+1}/{len(ordered_tars)}] Connecting to tar {tar_number} "
+        pbar.write(f"\n[{tar_idx+1}/{len(ordered_tars)}] Tar {tar_number} "
                    f"({chunks_in_tar:,} chunks expected) ...")
 
         # Build per-tar lookup
@@ -144,16 +153,17 @@ def main():
         if cache_dir:
             cache_dir.mkdir(parents=True, exist_ok=True)
 
+        local_tar = _download_tar(tar_number, hf_token, str(cache_dir))
+        pbar.write(f"  Using {local_tar}")
+
         dataset = (
-            wds.WebDataset(url, shardshuffle=False,
-                           cache_dir=str(cache_dir) if cache_dir else None,
+            wds.WebDataset(local_tar, shardshuffle=False,
                            handler=wds.handlers.ignore_and_continue)
             .to_tuple("mp3", "__key__", "__url__",
                       handler=wds.handlers.ignore_and_continue)
         )
 
         for mp3_bytes, key, _url in dataset:
-            # WDS key is full path in tar (e.g. "audio/00001"), index stores basename only
             idxs = tar_lookup.get(os.path.basename(key))
             if idxs is None:
                 continue
@@ -162,21 +172,20 @@ def main():
                 decoder = AudioDecoder(source=mp3_bytes,
                                        sample_rate=args.target_sr,
                                        num_channels=1)
+                full_audio = decoder.get_all_samples().data.squeeze(0)
             except Exception:
                 continue
 
+            sr = args.target_sr
             for idx in idxs:
                 entry = index_entries[idx]
-                try:
-                    waveform = decoder.get_samples_played_in_range(
-                        entry["start_sec"], entry["end_sec"]
-                    ).data.squeeze(0)
-                    if waveform.shape[0] == 0:
-                        continue
-                except Exception:
+                start_sample = int(entry["start_sec"] * sr)
+                end_sample = int(entry["end_sec"] * sr)
+                waveform = full_audio[start_sample:end_sample]
+                if waveform.shape[0] == 0:
                     continue
 
-                mfcc = extract_mfcc(waveform, sample_rate=args.target_sr)
+                mfcc = extract_mfcc(waveform, sample_rate=sr)
                 mfcc_list[idx] = mfcc
                 collected_count += 1
                 if not first_chunk_logged:

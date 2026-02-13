@@ -20,8 +20,32 @@ import webdataset as wds
 from torchcodec.decoders import AudioDecoder
 
 
-def _build_tar_urls(tar_numbers, hf_token):
-    """Build pipe:curl URLs for a specific set of tar numbers."""
+def _download_tar(tar_number, hf_token, cache_dir):
+    """Download a tar to cache_dir if not already cached, return local path."""
+    tn_str = str(tar_number).zfill(6)
+    dest = os.path.join(cache_dir, f"{tn_str}.tar")
+    if os.path.exists(dest):
+        return dest
+    folder = "audio" if int(tar_number) <= 5000 else "audio2"
+    url = (
+        f"https://huggingface.co/datasets/MLCommons/"
+        f"unsupervised_peoples_speech/resolve/main/{folder}/{tn_str}.tar?download=True"
+    )
+    os.makedirs(cache_dir, exist_ok=True)
+    temp = dest + f".tmp{os.getpid()}"
+    import subprocess
+    subprocess.run(
+        ["curl", "-s", "-L", "-o", temp, "-H", f"Authorization:Bearer {hf_token}", url],
+        check=True,
+    )
+    os.rename(temp, dest)
+    return dest
+
+
+def _build_tar_urls(tar_numbers, hf_token, cache_dir=None):
+    """Build local paths (cached) or pipe:curl URLs for tar numbers."""
+    if cache_dir:
+        return [_download_tar(tn, hf_token, cache_dir) for tn in sorted(tar_numbers)]
     token = f"Authorization:Bearer {hf_token}"
     urls = []
     for tn in sorted(tar_numbers):
@@ -66,11 +90,12 @@ def _decode_pretraining(sample, lookup, target_sr=16000):
     results = []
     try:
         decoder = AudioDecoder(source=mp3_bytes, sample_rate=target_sr, num_channels=1)
+        full_audio = decoder.get_all_samples().data.squeeze(0)
 
         for entry in entries:
-            waveform = decoder.get_samples_played_in_range(
-                entry["start_sec"], entry["end_sec"]
-            ).data.squeeze(0)
+            start_sample = int(entry["start_sec"] * target_sr)
+            end_sample = int(entry["end_sec"] * target_sr)
+            waveform = full_audio[start_sample:end_sample]
 
             results.append({
                 "waveform": waveform.numpy(),
@@ -123,7 +148,7 @@ def _flatten_list(stream):
             yield sample
 
 
-def build_pretraining_dataset(index_path, hf_token=None, target_sr=16000):
+def build_pretraining_dataset(index_path, hf_token=None, target_sr=16000, cache_dir="./data/tar_cache"):
     """Build a WebDataset that yields {waveform, labels} from a pretraining index.
 
     If the index entries contain a "language" field, creates one WebDataset per
@@ -147,16 +172,16 @@ def build_pretraining_dataset(index_path, hf_token=None, target_sr=16000):
     has_language = any("language" in e for e in index_entries)
 
     if has_language:
-        return _build_multilang_dataset(index_entries, hf_token, target_sr)
+        return _build_multilang_dataset(index_entries, hf_token, target_sr, cache_dir)
     else:
-        return _build_single_dataset(index_entries, hf_token, target_sr)
+        return _build_single_dataset(index_entries, hf_token, target_sr, cache_dir)
 
 
-def _build_single_dataset(index_entries, hf_token, target_sr):
+def _build_single_dataset(index_entries, hf_token, target_sr, cache_dir=None):
     """Build a single WebDataset over all entries (legacy path)."""
     lookup = _build_lookup(index_entries)
     tar_numbers = {e["tar_number"] for e in index_entries}
-    urls = _build_tar_urls(tar_numbers, hf_token)
+    urls = _build_tar_urls(tar_numbers, hf_token, cache_dir)
 
     dataset = (
         wds.WebDataset(urls, shardshuffle=True, handler=wds.handlers.ignore_and_continue)
@@ -169,7 +194,7 @@ def _build_single_dataset(index_entries, hf_token, target_sr):
     return dataset
 
 
-def _build_multilang_dataset(index_entries, hf_token, target_sr):
+def _build_multilang_dataset(index_entries, hf_token, target_sr, cache_dir=None):
     """Build per-language WebDatasets combined with RandomMix."""
     # Group entries by language
     entries_by_lang = defaultdict(list)
@@ -187,7 +212,7 @@ def _build_multilang_dataset(index_entries, hf_token, target_sr):
     for lang, entries in sorted(entries_by_lang.items()):
         lookup = _build_lookup(entries)
         tar_numbers = {e["tar_number"] for e in entries}
-        urls = _build_tar_urls(tar_numbers, hf_token)
+        urls = _build_tar_urls(tar_numbers, hf_token, cache_dir)
 
         ds = (
             wds.WebDataset(urls, shardshuffle=False, handler=wds.handlers.ignore_and_continue)
@@ -204,5 +229,8 @@ def _build_multilang_dataset(index_entries, hf_token, target_sr):
 
     # Interleave proportionally across languages
     # shuffle(5000): larger buffer compensates for tar-sequential locality
-    dataset = wds.RandomMix(datasets, probs=probs)
-    return dataset.shuffle(5000)
+    dataset = wds.DataPipeline(
+        wds.RandomMix(datasets, probs=probs),
+        wds.shuffle(5000),
+    )
+    return dataset
