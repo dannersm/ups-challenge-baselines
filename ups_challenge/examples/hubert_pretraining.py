@@ -217,6 +217,8 @@ def train_hubert(
     grad_accum_steps=4,
     warmup_steps=1500,
     max_grad_norm=1.0,
+    save_every_steps=500,
+    resume=False,
 ):
     # Device
     if device is None:
@@ -247,6 +249,42 @@ def train_hubert(
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
+    # Resume from checkpoint if requested
+    os.makedirs(output_dir, exist_ok=True)
+    global_step = 0
+    micro_step = 0
+    start_epoch = 0
+    loss_history = []
+    accum_loss = 0.0
+
+    resume_ckpt_path = os.path.join(output_dir, "training_state.pt")
+    if resume and os.path.exists(resume_ckpt_path):
+        print(f"Resuming from {resume_ckpt_path}...")
+        ckpt = torch.load(resume_ckpt_path, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt["model"])
+        optimizer.load_state_dict(ckpt["optimizer"])
+        scheduler.load_state_dict(ckpt["scheduler"])
+        global_step = ckpt["global_step"]
+        micro_step = ckpt["micro_step"]
+        start_epoch = ckpt["epoch"]
+        loss_history = ckpt.get("loss_history", [])
+        print(f"  Resumed at epoch {start_epoch+1}, global_step {global_step}")
+
+    def _save_training_state(epoch_idx):
+        """Save full training state for resumability."""
+        state = {
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
+            "global_step": global_step,
+            "micro_step": micro_step,
+            "epoch": epoch_idx,
+            "loss_history": loss_history,
+        }
+        tmp = resume_ckpt_path + f".tmp{os.getpid()}"
+        torch.save(state, tmp)
+        os.rename(tmp, resume_ckpt_path)
+
     # Data
     print(f"Loading pretraining index: {index_path}")
     dataset = build_pretraining_dataset(index_path=index_path, hf_token=hf_token,
@@ -259,19 +297,23 @@ def train_hubert(
     )
 
     # Train
-    print("Starting training ...")
-    os.makedirs(output_dir, exist_ok=True)
-    
-    global_step = 0
-    micro_step = 0
-    loss_history = []  # (step, loss)
-    accum_loss = 0.0
-    for epoch in range(num_epochs):
+    print(f"Starting training (epochs {start_epoch+1}-{num_epochs}, "
+          f"save every {save_every_steps} steps)...")
+
+    for epoch in range(start_epoch, num_epochs):
         epoch_loss = 0.0
         num_batches = 0
+        batches_to_skip = 0
+
+        # If resuming mid-epoch, skip already-seen batches
+        if epoch == start_epoch and micro_step > 0:
+            batches_to_skip = micro_step
+            print(f"  Skipping {batches_to_skip} micro-batches to resume mid-epoch...")
 
         pbar = tqdm(data_loader, desc=f"Epoch {epoch + 1}/{num_epochs}")
-        for batch in pbar:
+        for batch_idx, batch in enumerate(pbar):
+            if batch_idx < batches_to_skip:
+                continue
             if batch is None:
                 continue
 
@@ -320,24 +362,31 @@ def train_hubert(
             loss_history.append((global_step, loss_val))
             pbar.set_postfix({
                 "loss": f"{loss_val:.4f}",
-                "avg": f"{epoch_loss / num_batches:.4f}",
+                "avg": f"{epoch_loss / max(num_batches, 1):.4f}",
                 "lr": f"{scheduler.get_last_lr()[0]:.2e}",
             })
 
+            # Periodic checkpoint
+            if save_every_steps and global_step % save_every_steps == 0:
+                print(f"\n  Saving checkpoint at step {global_step}...")
+                _save_training_state(epoch)
+                _save_loss_plot(loss_history, output_dir)
+
             if max_steps is not None and global_step >= max_steps:
                 print(f"\nReached max_steps={max_steps}, stopping.")
-                ckpt_path = os.path.join(output_dir, f"hubert_step_{global_step}.pt")
-                print(f"Saving step checkpoint to {ckpt_path}")
-                torch.save(model.state_dict(), ckpt_path)
+                _save_training_state(epoch)
                 _save_loss_plot(loss_history, output_dir)
                 return
 
-        print(f"Epoch {epoch + 1} done. avg_loss={epoch_loss / num_batches:.4f}")
+        avg = epoch_loss / max(num_batches, 1)
+        print(f"Epoch {epoch + 1} done. avg_loss={avg:.4f}")
 
         # Save checkpoint at end of epoch
         ckpt_path = os.path.join(output_dir, f"hubert_epoch_{epoch + 1}.pt")
         print(f"Saving epoch checkpoint to {ckpt_path}")
         torch.save(model.state_dict(), ckpt_path)
+        micro_step = 0  # Reset for next epoch
+        _save_training_state(epoch + 1)
 
     print("Training completed!")
     _save_loss_plot(loss_history, output_dir)
@@ -367,6 +416,10 @@ if __name__ == "__main__":
     parser.add_argument("--cache_dir", type=str, default="./data/tar_cache",
                         help="Directory to cache downloaded tars (reused across runs)")
     parser.add_argument("--output_dir", type=str, default="./checkpoints")
+    parser.add_argument("--save_every_steps", type=int, default=500,
+                        help="Save full training state every N optimizer steps")
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume from training_state.pt in output_dir")
     args = parser.parse_args()
 
     hf_token = args.hf_token or os.getenv("HF_TOKEN")
@@ -388,4 +441,6 @@ if __name__ == "__main__":
         grad_accum_steps=args.grad_accum_steps,
         warmup_steps=args.warmup_steps,
         max_grad_norm=args.max_grad_norm,
+        save_every_steps=args.save_every_steps,
+        resume=args.resume,
     )
