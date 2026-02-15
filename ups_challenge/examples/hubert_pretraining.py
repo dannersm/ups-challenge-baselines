@@ -313,17 +313,6 @@ def train_hubert(
         torch.save(state, tmp)
         os.rename(tmp, resume_ckpt_path)
 
-    # Data
-    print(f"Loading pretraining index: {index_path}")
-    dataset = build_pretraining_dataset(index_path=index_path, hf_token=hf_token,
-                                            cache_dir=cache_dir)
-    data_loader = torch.utils.data.DataLoader(
-        dataset,
-        batch_size=batch_size,
-        num_workers=num_workers,
-        collate_fn=collate_pretraining,
-    )
-
     # Train
     print(f"Starting training (epochs {start_epoch+1}-{total_epochs}, "
           f"save every {save_every_steps} steps)...")
@@ -335,6 +324,21 @@ def train_hubert(
                   f"lr={learning_rate:.2e}, warmup={warmup_steps} steps ---")
             optimizer, scheduler = _setup_cpt_phase()
             global_step = 0  # reset step counter for CPT warmup
+            model.zero_grad()
+            accum_loss = 0.0
+            micro_step = 0
+
+        # Rebuild dataset + loader each epoch so the WebDataset iterator
+        # starts fresh (RandomMix / DataPipeline don't reset on re-iter).
+        dataset = build_pretraining_dataset(index_path=index_path, hf_token=hf_token,
+                                            cache_dir=cache_dir)
+        data_loader = torch.utils.data.DataLoader(
+            dataset,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            collate_fn=collate_pretraining,
+        )
+
         epoch_loss = 0.0
         num_batches = 0
         batches_to_skip = 0
