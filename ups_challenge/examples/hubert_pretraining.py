@@ -219,6 +219,8 @@ def train_hubert(
     max_grad_norm=1.0,
     save_every_steps=500,
     resume=False,
+    projection_warmup_epochs=0,
+    projection_lr=None,
 ):
     # Device
     if device is None:
@@ -239,15 +241,36 @@ def train_hubert(
     model.to(device)
     model.train()
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+    total_epochs = projection_warmup_epochs + num_epochs
+    if projection_lr is None:
+        projection_lr = learning_rate
 
-    # LR scheduler: linear warmup then constant
-    def lr_lambda(current_step):
-        if current_step < warmup_steps:
-            return float(current_step) / float(max(1, warmup_steps))
-        return 1.0
+    def _setup_projection_phase():
+        """Phase 1: freeze hubert, train only projection with flat LR."""
+        model.hubert.requires_grad_(False)
+        model.projection.requires_grad_(True)
+        opt = torch.optim.AdamW(model.projection.parameters(), lr=projection_lr)
+        sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda step: 1.0)
+        return opt, sched
 
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    def _setup_cpt_phase():
+        """Phase 2: unfreeze everything, train with warmup."""
+        model.hubert.requires_grad_(True)
+        model.projection.requires_grad_(True)
+        opt = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+        sched = torch.optim.lr_scheduler.LambdaLR(
+            opt,
+            lambda step: min(1.0, float(step) / float(max(1, warmup_steps))),
+        )
+        return opt, sched
+
+    # Start in the right phase
+    if projection_warmup_epochs > 0:
+        print(f"Phase 1: projection warmup for {projection_warmup_epochs} epoch(s), "
+              f"lr={projection_lr:.2e}")
+        optimizer, scheduler = _setup_projection_phase()
+    else:
+        optimizer, scheduler = _setup_cpt_phase()
 
     # Resume from checkpoint if requested
     os.makedirs(output_dir, exist_ok=True)
@@ -262,12 +285,17 @@ def train_hubert(
         print(f"Resuming from {resume_ckpt_path}...")
         ckpt = torch.load(resume_ckpt_path, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model"])
-        optimizer.load_state_dict(ckpt["optimizer"])
-        scheduler.load_state_dict(ckpt["scheduler"])
         global_step = ckpt["global_step"]
         micro_step = ckpt["micro_step"]
         start_epoch = ckpt["epoch"]
         loss_history = ckpt.get("loss_history", [])
+        # Re-setup the right phase before restoring optimizer/scheduler
+        if start_epoch < projection_warmup_epochs:
+            optimizer, scheduler = _setup_projection_phase()
+        else:
+            optimizer, scheduler = _setup_cpt_phase()
+        optimizer.load_state_dict(ckpt["optimizer"])
+        scheduler.load_state_dict(ckpt["scheduler"])
         print(f"  Resumed at epoch {start_epoch+1}, global_step {global_step}")
 
     def _save_training_state(epoch_idx):
@@ -297,10 +325,16 @@ def train_hubert(
     )
 
     # Train
-    print(f"Starting training (epochs {start_epoch+1}-{num_epochs}, "
+    print(f"Starting training (epochs {start_epoch+1}-{total_epochs}, "
           f"save every {save_every_steps} steps)...")
 
-    for epoch in range(start_epoch, num_epochs):
+    for epoch in range(start_epoch, total_epochs):
+        # Phase transition: projection warmup -> CPT
+        if epoch == projection_warmup_epochs and projection_warmup_epochs > 0:
+            print(f"\n--- Phase 2: CPT (unfreezing all layers), "
+                  f"lr={learning_rate:.2e}, warmup={warmup_steps} steps ---")
+            optimizer, scheduler = _setup_cpt_phase()
+            global_step = 0  # reset step counter for CPT warmup
         epoch_loss = 0.0
         num_batches = 0
         batches_to_skip = 0
@@ -310,7 +344,8 @@ def train_hubert(
             batches_to_skip = micro_step
             print(f"  Skipping {batches_to_skip} micro-batches to resume mid-epoch...")
 
-        pbar = tqdm(data_loader, desc=f"Epoch {epoch + 1}/{num_epochs}")
+        phase_str = "proj" if epoch < projection_warmup_epochs else "CPT"
+        pbar = tqdm(data_loader, desc=f"Epoch {epoch + 1}/{total_epochs} [{phase_str}]")
         for batch_idx, batch in enumerate(pbar):
             if batch_idx < batches_to_skip:
                 continue
@@ -420,6 +455,10 @@ if __name__ == "__main__":
                         help="Save full training state every N optimizer steps")
     parser.add_argument("--resume", action="store_true",
                         help="Resume from training_state.pt in output_dir")
+    parser.add_argument("--projection_warmup_epochs", type=int, default=0,
+                        help="Epochs to train only projection head before CPT (default: 0)")
+    parser.add_argument("--projection_lr", type=float, default=None,
+                        help="LR for projection warmup phase (default: same as learning_rate)")
     args = parser.parse_args()
 
     hf_token = args.hf_token or os.getenv("HF_TOKEN")
@@ -443,4 +482,6 @@ if __name__ == "__main__":
         max_grad_norm=args.max_grad_norm,
         save_every_steps=args.save_every_steps,
         resume=args.resume,
+        projection_warmup_epochs=args.projection_warmup_epochs,
+        projection_lr=args.projection_lr,
     )

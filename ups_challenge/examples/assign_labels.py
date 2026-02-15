@@ -263,8 +263,35 @@ def main():
                       handler=wds.handlers.ignore_and_continue)
         )
 
-        # Collect MFCCs for this tar, then batch partial_fit + predict
-        tar_mfccs: list[tuple[int, np.ndarray]] = []
+        # Process MFCCs in micro-batches to avoid OOM on large tars
+        BATCH_SIZE = 2000  # chunks per micro-batch (~300 MB peak)
+        batch_mfccs: list[tuple[int, np.ndarray]] = []
+
+        def _flush_batch():
+            """Process accumulated micro-batch: stats, partial_fit, predict."""
+            nonlocal kmeans_initialized, collected_count
+            if not batch_mfccs:
+                return
+            all_frames = np.concatenate([m for _, m in batch_mfccs], axis=0)
+            stats.update_batch(all_frames)
+
+            current_std = stats.std + 1e-8
+            normalized = (all_frames - stats.mean) / current_std
+
+            kmeans.partial_fit(normalized)
+            kmeans_initialized = True
+
+            offset = 0
+            for idx, mfcc in batch_mfccs:
+                n_frames = mfcc.shape[0]
+                chunk_norm = normalized[offset:offset + n_frames]
+                labels_dict[idx] = kmeans.predict(chunk_norm).astype(np.int16)
+                offset += n_frames
+                collected_count += 1
+                pbar.update(1)
+
+            del all_frames, normalized
+            batch_mfccs.clear()
 
         for mp3_bytes, key, _url in dataset:
             idxs = tar_lookup.get(os.path.basename(key))
@@ -289,39 +316,17 @@ def main():
                     continue
 
                 mfcc = extract_mfcc(waveform, sample_rate=sr)
-                tar_mfccs.append((idx, mfcc))
+                batch_mfccs.append((idx, mfcc))
 
                 if not first_chunk_logged:
                     pbar.write(f"  First chunk arrived after {time.time()-t0:.1f}s")
                     first_chunk_logged = True
 
-        if tar_mfccs:
-            # Update running stats with all frames from this tar
-            all_frames = np.concatenate([m for _, m in tar_mfccs], axis=0)
-            stats.update_batch(all_frames)
+            if len(batch_mfccs) >= BATCH_SIZE:
+                _flush_batch()
 
-            # Normalize with current running stats
-            current_std = stats.std + 1e-8
-            normalized = (all_frames - stats.mean) / current_std
-
-            # partial_fit KMeans
-            if not kmeans_initialized:
-                kmeans.partial_fit(normalized)
-                kmeans_initialized = True
-            else:
-                kmeans.partial_fit(normalized)
-
-            # Predict labels for each chunk in this tar
-            offset = 0
-            for idx, mfcc in tar_mfccs:
-                n_frames = mfcc.shape[0]
-                chunk_norm = normalized[offset:offset + n_frames]
-                labels_dict[idx] = kmeans.predict(chunk_norm).astype(np.int16)
-                offset += n_frames
-                collected_count += 1
-                pbar.update(1)
-
-            del all_frames, normalized
+        # Flush remaining chunks for this tar
+        _flush_batch()
 
         completed_tars.add(tar_number)
         tars_since_save += 1
